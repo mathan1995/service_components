@@ -1,0 +1,118 @@
+# definitions contains common stuff that can be referenced in the pipeline
+default_script_multiline_blocks:
+  - &oidc_setup |
+    export AWS_REGION=${AWS_REGION}
+    export AWS_ROLE_ARN=${AWS_IAM_ARN}
+    export AWS_WEB_IDENTITY_TOKEN_FILE=$(pwd)/web-identity-token
+    echo $BITBUCKET_STEP_OIDC_TOKEN > $(pwd)/web-identity-token
+  - &deploy_lambda |
+    source username.sh
+    export STACK_NAME=institution-control-service
+    export ENVIRONMENT_OWNER=${BITBUCKET_USERNAME}
+    export ENVIRONMENT_REGION=${AWS_REGION}
+    npm ci
+    npm install -g serverless
+    serverless --version
+    serverless deploy --stage ${ENVIRONMENT_PROFILE} --region ${ENVIRONMENT_REGION}
+    serverless invoke --function migrationUp --stage ${ENVIRONMENT_PROFILE} --region ${ENVIRONMENT_REGION}
+
+# definitions contains common stuff that can be referenced in the pipeline
+definitions:
+  steps:
+    # Based on https://developer.atlassian.com/bitbucket/api/2/reference/resource/user
+    - step: &get_username
+        name: 'Get Username'
+        image: atlassian/default-image:2
+        script:
+          - apt-get update && apt-get install -y jq
+          - BITBUCKET_USERNAME=$(curl -X GET -g "https://api.bitbucket.org/2.0/users/${BITBUCKET_STEP_TRIGGERER_UUID}" | jq --raw-output '.display_name')
+          - echo ${BITBUCKET_USERNAME}
+          - |
+            echo "export BITBUCKET_USERNAME=\"${BITBUCKET_USERNAME}\"" >> username.sh
+        artifacts:
+          - username.sh
+    - step: &linting
+        name: Lint
+        image: node:16-slim
+        script:
+          - npm ci
+          - npm run lint
+        caches:
+          - node
+    - step: &prettier
+        name: Prettier
+        image: node:16-slim
+        script:
+          - npm ci
+          - npm run prettier-check
+        caches:
+          - node
+    - step: &testing
+        name: Test
+        image: node:16-slim
+        script:
+          - npm ci
+          - npm run test
+        caches:
+          - node
+pipelines:
+  default:
+    - parallel:
+        - step: *linting
+        - step: *prettier
+        - step: *testing
+
+  custom:
+    Deploy to lovelace dev environment:
+      - variables:
+          - name: SKIP_ACCESS_TOKEN_CHECK
+          - name: SCHEDULE_HOURLY_ENABLED
+          - name: UDIFY_API_URL
+          - name: INVENTORY_API_URL
+          - name: UDIFY_CLIENT_ID
+          - name: UDIFY_CLIENT_SECRET
+      - step: *get_username
+      - parallel:
+          - step: *linting
+          - step: *testing
+      - step:
+          name: Deploy to Development
+          image: node:16-slim
+          oidc: true
+          deployment: dev
+          script:
+            - set -eu; set -o pipefail
+            - *oidc_setup
+            - *deploy_lambda
+
+    Deploy to lovelace stage environment:
+      - step: *get_username
+      - parallel:
+          - step: *linting
+          - step: *testing
+      - step:
+          name: Deploy to Stage
+          image: node:16-slim
+          oidc: true
+          deployment: stage
+          script:
+            - set -eu; set -o pipefail
+            - *oidc_setup
+            - *deploy_lambda
+
+    Deploy to lovelace prod environment:
+      - step: *get_username
+      - parallel:
+          - step: *linting
+          - step: *testing
+      - step:
+          name: Deploy to Production
+          image: node:16-slim
+          oidc: true
+          deployment: prod
+          caches:
+            - node
+          script:
+            - set -eu; set -o pipefail
+            - *oidc_setup
+            - *deploy_lambda

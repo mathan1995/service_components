@@ -1,0 +1,143 @@
+service: institution-control-service
+frameworkVersion: '3'
+useDotenv: true
+
+package:
+  individually: true
+
+custom:
+  settings:
+    STAGE: ${opt:stage, 'dev'}
+    SERVICE_NAME: ${self:service}-${self:custom.settings.STAGE}
+    STATUS_UPDATE_QUEUE: ${self:custom.settings.SERVICE_NAME}-${self:custom.settings.STAGE}-update-status-queue
+    STATUS_UPDATE_DLQ: ${self:custom.settings.SERVICE_NAME}-${self:custom.settings.STAGE}-update-status-dlq
+
+  webpack:
+    includeModules:
+      forceInclude:
+        - mysql2 # Force include mysql2 as it is dynamically required by sequelize
+
+provider:
+  name: aws
+  runtime: nodejs14.x
+  environment:
+    DB_HOST: ${env:DB_HOST}
+    DB_PORT: ${env:DB_PORT}
+    DB_NAME: ${env:DB_NAME}
+    DB_USERNAME: ${env:DB_USERNAME}
+    DB_PASSWORD: ${env:DB_PASSWORD}
+    INVENTORY_API_URL: ${env:INVENTORY_API_URL, null}
+    UDIFY_API_URL: ${env:UDIFY_API_URL, null}
+    COURSE_LEVEL_CONTROL_ENABLED: ${env:COURSE_LEVEL_CONTROL_ENABLED}
+    INTAKE_LEVEL_CONTROL_ENABLED: ${env:INTAKE_LEVEL_CONTROL_ENABLED}
+    UDIFY_CLIENT_ID: ${env:UDIFY_CLIENT_ID, null}
+    UDIFY_CLIENT_SECRET: ${env:UDIFY_CLIENT_SECRET, null}
+    SQS_QUEUE_UPDATE_STATUS_URL: { Ref: SQSQueueUpdateStatus }
+
+  vpc:
+    securityGroupIds:
+      - ${env:VPC_SECURITY_GROUP_ID, null}
+    subnetIds:
+      - ${env:VPC_SUBNET_ID, null}
+  stackTags:
+    Name: ${self:custom.settings.SERVICE_NAME}
+    Profile: ${self:custom.settings.STAGE}
+    Owner: Lovelace
+  iam:
+    role:
+      statements:
+        # Allow functions to publish messages to SNS DLQ
+        - Effect: Allow
+          Action: sns:Publish
+          Resource:
+            Ref: SNSTopicDLQ
+        # Allow functions to publish messages to SQS
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+          Resource:
+            Fn::GetAtt:
+              - SQSQueueUpdateStatus
+              - Arn
+
+plugins:
+  - serverless-webpack
+  - serverless-offline
+
+functions:
+  graphql:
+    handler: src/graphql/graphql.graphqlHandler
+    events:
+      - http:
+          path: /graphql
+          method: any
+          cors: true
+    environment:
+      SKIP_ACCESS_TOKEN_CHECK: ${env:SKIP_ACCESS_TOKEN_CHECK, null}
+
+  migrationUp:
+    handler: src/handler/migration.up
+
+  migrationDown:
+    handler: src/handler/migration.down
+
+  processCloseToday:
+    handler: src/handler/process-schedules.closeTodayHandler
+    events: ${file(./serverless/schedule-config.js):schedules}
+    onError:
+      Ref: SNSTopicDLQ
+    timeout: 60
+
+  processReopenToday:
+    handler: src/handler/process-schedules.reopenTodayHandler
+    events: ${file(./serverless/schedule-config.js):schedules}
+    onError:
+      Ref: SNSTopicDLQ
+    timeout: 60
+
+  sqsUpdateCourseStatus:
+    handler: src/handler/update-course-status.updateStatusHandler
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - SQSQueueUpdateStatus
+              - Arn
+          batchSize: 1
+          enabled: true
+    onError:
+      Ref: SNSTopicDLQ
+    timeout: 60
+
+resources:
+  Resources:
+    SNSTopicDLQ:
+      Type: AWS::SNS::Topic
+      Properties:
+        KmsMasterKeyId: alias/aws/sns
+        TopicName: intake-control-sns-dlq
+
+    SNSSubscriptionDLQ:
+      Type: AWS::SNS::Subscription
+      Properties:
+        Endpoint: ${env:SNS_SUBSCRIPTION_EMAIL}
+        Protocol: email
+        TopicArn:
+          Ref: SNSTopicDLQ
+
+    SQSQueueUpdateStatus:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.settings.STATUS_UPDATE_QUEUE}
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt:
+              - SQSQueueUpdateStatusDLQ
+              - Arn
+          maxReceiveCount: 1
+        VisibilityTimeout: 60
+
+    SQSQueueUpdateStatusDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.settings.STATUS_UPDATE_DLQ}
